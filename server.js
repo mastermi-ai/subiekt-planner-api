@@ -1,36 +1,56 @@
 const express = require('express');
 const cors = require('cors');
-const Database = require('better-sqlite3');
+const { Pool } = require('pg');
 
 const app = express();
-const db = new Database('data.db');
+
+// Use connection string from environment variable
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false // Required for Render
+  }
+});
 
 app.use(cors());
 app.use(express.json());
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS branches (
-    id TEXT, client_id TEXT, name TEXT,
-    PRIMARY KEY (id, client_id)
-  );
-  CREATE TABLE IF NOT EXISTS products (
-    id TEXT, client_id TEXT, sku TEXT, name TEXT, supplier_id TEXT,
-    PRIMARY KEY (id, client_id)
-  );
-  CREATE TABLE IF NOT EXISTS stocks (
-    product_id TEXT, branch_id TEXT, client_id TEXT, quantity INTEGER,
-    PRIMARY KEY (product_id, branch_id, client_id)
-  );
-  CREATE TABLE IF NOT EXISTS sales (
-    id TEXT, client_id TEXT, product_id TEXT, date TEXT, quantity INTEGER,
-    PRIMARY KEY (id, client_id)
-  );
-  CREATE TABLE IF NOT EXISTS clients (
-    id TEXT PRIMARY KEY, api_key TEXT, read_token TEXT
-  );
-`);
+// Initialize DB
+async function initDb() {
+  const client = await pool.connect();
+  try {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS branches (
+        id TEXT, client_id TEXT, name TEXT,
+        PRIMARY KEY (id, client_id)
+      );
+      CREATE TABLE IF NOT EXISTS products (
+        id TEXT, client_id TEXT, sku TEXT, name TEXT, supplier_id TEXT,
+        PRIMARY KEY (id, client_id)
+      );
+      CREATE TABLE IF NOT EXISTS stocks (
+        product_id TEXT, branch_id TEXT, client_id TEXT, quantity INTEGER,
+        PRIMARY KEY (product_id, branch_id, client_id)
+      );
+      CREATE TABLE IF NOT EXISTS sales (
+        id TEXT, client_id TEXT, product_id TEXT, date TEXT, quantity INTEGER,
+        PRIMARY KEY (id, client_id)
+      );
+      CREATE TABLE IF NOT EXISTS clients (
+        id TEXT PRIMARY KEY, api_key TEXT, read_token TEXT
+      );
+    `);
+    console.log('Database initialized');
+  } catch (err) {
+    console.error('Error initializing database:', err);
+  } finally {
+    client.release();
+  }
+}
 
-function authConnector(req, res, next) {
+initDb();
+
+async function authConnector(req, res, next) {
   // Accept both X-API-Key header and Bearer token
   const apiKey = req.headers['x-api-key'] || req.headers['authorization']?.replace('Bearer ', '');
   const clientId = req.headers['x-client-id'];
@@ -39,16 +59,20 @@ function authConnector(req, res, next) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
-  const client = db.prepare('SELECT * FROM clients WHERE id = ? AND api_key = ?').get(clientId, apiKey);
-  if (!client) {
-    return res.status(401).json({ error: 'Invalid credentials' });
+  try {
+    const result = await pool.query('SELECT * FROM clients WHERE id = $1 AND api_key = $2', [clientId, apiKey]);
+    if (result.rows.length === 0) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    req.clientId = clientId;
+    next();
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
   }
-
-  req.clientId = clientId;
-  next();
 }
 
-function authFrontend(req, res, next) {
+async function authFrontend(req, res, next) {
   const token = req.headers['authorization']?.replace('Bearer ', '');
   const clientId = req.headers['x-client-id'];
 
@@ -56,110 +80,191 @@ function authFrontend(req, res, next) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
-  const client = db.prepare('SELECT * FROM clients WHERE id = ? AND read_token = ?').get(clientId, token);
-  if (!client) {
-    return res.status(401).json({ error: 'Invalid credentials' });
+  try {
+    const result = await pool.query('SELECT * FROM clients WHERE id = $1 AND read_token = $2', [clientId, token]);
+    if (result.rows.length === 0) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    req.clientId = clientId;
+    next();
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
   }
-
-  req.clientId = clientId;
-  next();
 }
 
-app.get('/branches', authFrontend, (req, res) => {
-  const branches = db.prepare('SELECT id, name FROM branches WHERE client_id = ?').all(req.clientId);
-  res.json(branches);
+app.get('/branches', authFrontend, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT id, name FROM branches WHERE client_id = $1', [req.clientId]);
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.get('/products', authFrontend, (req, res) => {
-  const products = db.prepare('SELECT id, sku, name, supplier_id as supplierId FROM products WHERE client_id = ?').all(req.clientId);
-  const stocks = db.prepare('SELECT product_id, branch_id, quantity FROM stocks WHERE client_id = ?').all(req.clientId);
+app.get('/products', authFrontend, async (req, res) => {
+  try {
+    const productsRes = await pool.query('SELECT id, sku, name, supplier_id as "supplierId" FROM products WHERE client_id = $1', [req.clientId]);
+    const stocksRes = await pool.query('SELECT product_id, branch_id, quantity FROM stocks WHERE client_id = $1', [req.clientId]);
 
-  const result = products.map(p => ({
-    ...p,
-    stockByBranch: stocks
-      .filter(s => s.product_id === p.id)
-      .reduce((acc, s) => {
-        acc[s.branch_id] = s.quantity;
-        return acc;
-      }, {})
-  }));
+    const result = productsRes.rows.map(p => ({
+      ...p,
+      stockByBranch: stocksRes.rows
+        .filter(s => s.product_id === p.id)
+        .reduce((acc, s) => {
+          acc[s.branch_id] = s.quantity;
+          return acc;
+        }, {})
+    }));
 
-  res.json(result);
+    res.json(result);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.get('/sales', authFrontend, (req, res) => {
+app.get('/sales', authFrontend, async (req, res) => {
   const days = parseInt(req.query.days) || 90;
   const cutoffDate = new Date();
   cutoffDate.setDate(cutoffDate.getDate() - days);
   const cutoffStr = cutoffDate.toISOString().split('T')[0];
 
-  const sales = db.prepare('SELECT id, product_id as productId, date, quantity FROM sales WHERE client_id = ? AND date >= ?').all(req.clientId, cutoffStr);
-  res.json(sales);
+  try {
+    const result = await pool.query('SELECT id, product_id as "productId", date, quantity FROM sales WHERE client_id = $1 AND date >= $2', [req.clientId, cutoffStr]);
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.post('/ingest/branches', authConnector, (req, res) => {
+app.post('/ingest/branches', authConnector, async (req, res) => {
   const { data } = req.body;
-  const stmt = db.prepare('INSERT OR REPLACE INTO branches (id, client_id, name) VALUES (?, ?, ?)');
+  const client = await pool.connect();
 
-  const transaction = db.transaction((items) => {
-    for (const item of items) {
-      stmt.run(item.id, req.clientId, item.name);
+  try {
+    await client.query('BEGIN');
+    const query = `
+      INSERT INTO branches (id, client_id, name) 
+      VALUES ($1, $2, $3)
+      ON CONFLICT (id, client_id) DO UPDATE SET name = EXCLUDED.name
+    `;
+
+    for (const item of data) {
+      await client.query(query, [item.id, req.clientId, item.name]);
     }
-  });
 
-  transaction(data);
-  res.json({ status: 'ok', received: data.length });
+    await client.query('COMMIT');
+    res.json({ status: 'ok', received: data.length });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
 });
 
-app.post('/ingest/products', authConnector, (req, res) => {
+app.post('/ingest/products', authConnector, async (req, res) => {
   const { data } = req.body;
-  const stmt = db.prepare('INSERT OR REPLACE INTO products (id, client_id, sku, name, supplier_id) VALUES (?, ?, ?, ?, ?)');
+  const client = await pool.connect();
 
-  const transaction = db.transaction((items) => {
-    for (const item of items) {
-      stmt.run(item.id, req.clientId, item.sku, item.name, item.supplierId);
+  try {
+    await client.query('BEGIN');
+    const query = `
+      INSERT INTO products (id, client_id, sku, name, supplier_id) 
+      VALUES ($1, $2, $3, $4, $5)
+      ON CONFLICT (id, client_id) DO UPDATE SET 
+        sku = EXCLUDED.sku,
+        name = EXCLUDED.name,
+        supplier_id = EXCLUDED.supplier_id
+    `;
+
+    for (const item of data) {
+      await client.query(query, [item.id, req.clientId, item.sku, item.name, item.supplierId]);
     }
-  });
 
-  transaction(data);
-  res.json({ status: 'ok', received: data.length });
+    await client.query('COMMIT');
+    res.json({ status: 'ok', received: data.length });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
 });
 
-app.post('/ingest/stocks', authConnector, (req, res) => {
+app.post('/ingest/stocks', authConnector, async (req, res) => {
   const { data } = req.body;
-  const stmt = db.prepare('INSERT OR REPLACE INTO stocks (product_id, branch_id, client_id, quantity) VALUES (?, ?, ?, ?)');
+  const client = await pool.connect();
 
-  const transaction = db.transaction((items) => {
-    for (const item of items) {
-      stmt.run(item.productId, item.branchId, req.clientId, item.quantity);
+  try {
+    await client.query('BEGIN');
+    const query = `
+      INSERT INTO stocks (product_id, branch_id, client_id, quantity) 
+      VALUES ($1, $2, $3, $4)
+      ON CONFLICT (product_id, branch_id, client_id) DO UPDATE SET quantity = EXCLUDED.quantity
+    `;
+
+    for (const item of data) {
+      await client.query(query, [item.productId, item.branchId, req.clientId, item.quantity]);
     }
-  });
 
-  transaction(data);
-  res.json({ status: 'ok', received: data.length });
+    await client.query('COMMIT');
+    res.json({ status: 'ok', received: data.length });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
 });
 
-app.post('/ingest/sales', authConnector, (req, res) => {
+app.post('/ingest/sales', authConnector, async (req, res) => {
   const { data } = req.body;
-  const stmt = db.prepare('INSERT OR REPLACE INTO sales (id, client_id, product_id, date, quantity) VALUES (?, ?, ?, ?, ?)');
+  const client = await pool.connect();
 
-  const transaction = db.transaction((items) => {
-    for (const item of items) {
-      stmt.run(item.id, req.clientId, item.productId, item.date, item.quantity);
+  try {
+    await client.query('BEGIN');
+    const query = `
+      INSERT INTO sales (id, client_id, product_id, date, quantity) 
+      VALUES ($1, $2, $3, $4, $5)
+      ON CONFLICT (id, client_id) DO UPDATE SET 
+        product_id = EXCLUDED.product_id,
+        date = EXCLUDED.date,
+        quantity = EXCLUDED.quantity
+    `;
+
+    for (const item of data) {
+      await client.query(query, [item.id, req.clientId, item.productId, item.date, item.quantity]);
     }
-  });
 
-  transaction(data);
-  res.json({ status: 'ok', received: data.length });
+    await client.query('COMMIT');
+    res.json({ status: 'ok', received: data.length });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
 });
 
-app.post('/admin/add-client', (req, res) => {
+app.post('/admin/add-client', async (req, res) => {
   const { clientId, apiKey, readToken } = req.body;
 
   try {
-    db.prepare('INSERT INTO clients (id, api_key, read_token) VALUES (?, ?, ?)').run(clientId, apiKey, readToken);
+    await pool.query(
+      'INSERT INTO clients (id, api_key, read_token) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING',
+      [clientId, apiKey, readToken]
+    );
     res.json({ status: 'ok', message: 'Client added' });
   } catch (err) {
+    console.error(err);
     res.status(400).json({ error: err.message });
   }
 });
